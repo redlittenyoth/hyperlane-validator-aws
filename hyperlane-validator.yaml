@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hyperlane Validator - Production-ready ECS Fargate deployment with KMS and S3'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hyperlane-validator
+    Description: Project name for resource tagging.
+
+  OriginChainName:
+    Type: String
+    Description: Name of the chain being validated (e.g., ethereum, polygon, bsc).
+
+  RpcUrls:
+    Type: String
+    Description: Comma-separated list of RPC URLs for the origin chain.
+
+  ImageTag:
+    Type: String
+    Default: agents-v2.0.0
+    Description: Docker image tag for hyperlane-agent.
+
+  Cpu:
+    Type: Number
+    Default: 1024
+    Description: CPU units for the validator task (1024 = 1 vCPU).
+
+  Memory:
+    Type: Number
+    Default: 2048
+    Description: Memory for the validator task in MB.
+
+  S3BucketName:
+    Type: String
+    Description: (Optional) Name of an EXISTING S3 bucket for signatures. If left blank, a new bucket will be created.
+    Default: ''
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref S3BucketName, '']
+
+Resources:
+  # --- Networking ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-2'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Security Groups ---
+  ValidatorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Hyperlane Validator
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9090
+          ToPort: 9090
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sg'
+
+  # --- Storage ---
+  NewSignatureBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-signatures'
+
+  SignatureBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateS3Bucket
+    Properties:
+      Bucket: !Ref NewSignatureBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${NewSignatureBucket}/*'
+
+  ValidatorDB:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db'
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ValidatorDB
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ValidatorDB
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ValidatorSecurityGroup
+
+  # --- KMS Key for Signing ---
+  ValidatorKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Hyperlane Validator Key for ${OriginChainName}'
+      KeySpec: ECC_SECG_P256K1
+      KeyUsage: SIGN_VERIFY
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  ValidatorKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/hyperlane-validator-signer-${OriginChainName}'
+      TargetKeyId: !Ref ValidatorKey
+
+  # --- IAM Roles ---
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HyperlaneValidatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If [CreateS3Bucket, !Ref NewSignatureBucket, !Ref S3BucketName]
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If [CreateS3Bucket, !Ref NewSignatureBucket, !Ref S3BucketName]
+              - Effect: Allow
+                Action:
+                  - 'kms:Sign'
+                  - 'kms:GetPublicKey'
+                Resource: !GetAtt ValidatorKey.Arn
+
+  # --- ECS Cluster & Service ---
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-task'
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      Volumes:
+        - Name: validator-db
+          EFSVolumeConfiguration:
+            FileSystemId: !Ref ValidatorDB
+            TransitEncryption: ENABLED
+      ContainerDefinitions:
+        - Name: validator
+          Image: !Sub 'gcr.io/abacus-labs-dev/hyperlane-agent:${ImageTag}'
+          Command:
+            - './validator'
+            - '--db'
+            - '/hyperlane_db'
+            - '--originChainName'
+            - !Ref OriginChainName
+            - '--reorgPeriod'
+            - '1'
+            - '--validator.type'
+            - 'aws'
+            - '--validator.region'
+            - !Ref AWS::Region
+            - '--validator.id'
+            - !Sub 'alias/hyperlane-validator-signer-${OriginChainName}'
+            - '--checkpointSyncer.type'
+            - 's3'
+            - '--checkpointSyncer.region'
+            - !Ref AWS::Region
+            - '--checkpointSyncer.bucket'
+            - !If [CreateS3Bucket, !Ref NewSignatureBucket, !Ref S3BucketName]
+            - '--checkpointSyncer.folder'
+            - !Ref OriginChainName
+            - !Sub '--chains.${OriginChainName}.customRpcUrls=${RpcUrls}'
+            - !Sub '--chains.${OriginChainName}.signer.type=aws'
+            - !Sub '--chains.${OriginChainName}.signer.id=alias/hyperlane-validator-signer-${OriginChainName}'
+            - !Sub '--chains.${OriginChainName}.signer.region=${AWS::Region}'
+          MountPoints:
+            - SourceVolume: validator-db
+              ContainerPath: /hyperlane_db
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: validator
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ValidatorSecurityGroup
+
+Outputs:
+  KmsKeyArn:
+    Value: !GetAtt ValidatorKey.Arn
+  S3BucketName:
+    Value: !If [CreateS3Bucket, !Ref NewSignatureBucket, !Ref S3BucketName]
+  EcsCluster:
+    Value: !Ref Cluster
+  LogGroup:
+    Value: !Ref LogGroup
